@@ -75,7 +75,7 @@ def cloudflare_image(prompt: str, seed: int) -> Image.Image:
     acct = os.getenv("CF_ACCOUNT_ID", "").strip()
     token = os.getenv("CF_API_TOKEN", "").strip()
     url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{CF_IMAGE_MODEL}"
-    body = json.dumps({"prompt": prompt[:2000], "steps": 6, "seed": seed % (2 ** 31)}).encode()
+    body = json.dumps({"prompt": prompt[:2000], "steps": 6}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
