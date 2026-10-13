@@ -25,10 +25,8 @@ if not _tok.startswith("hf_"):
     print("\n*** HF_TOKEN missing or invalid. Open backend/token.txt and paste your token ***\n")
 else:
     print("HF_TOKEN loaded OK", flush=True)
-if os.getenv("CF_ACCOUNT_ID", "").strip() and os.getenv("CF_API_TOKEN", "").strip():
-    print("Cloudflare AI ready", flush=True)
-else:
-    print("Cloudflare keys not set", flush=True)
+_cid = os.getenv("CF_ACCOUNT_ID", "").strip()
+print(f"Cloudflare account id length={len(_cid)} ends={_cid[-4:]} token_set={bool(os.getenv('CF_API_TOKEN', '').strip())}", flush=True)
 
 IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
