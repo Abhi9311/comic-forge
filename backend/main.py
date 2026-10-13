@@ -28,7 +28,8 @@ else:
 
 IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-STORAGE = Path("storage"); STORAGE.mkdir(exist_ok=True)
+STORAGE = Path(__file__).resolve().parent / "storage"
+STORAGE.mkdir(parents=True, exist_ok=True)
 STYLES = {
     "Comic Book": "vibrant American comic book art, bold ink outlines, halftone shading, dynamic composition",
     "Manga": "black and white manga, screentone shading, expressive linework",
@@ -96,7 +97,7 @@ def make_image(client, prompt: str, seed: int, short: str) -> Image.Image:
             return pollinations_image(prompt, seed)
         except Exception:
             STATE["poll"] = False
-    return local_image(short, seed)  # short prompt: the local model only reads ~77 tokens
+    raise RuntimeError("Image generation services are temporarily unavailable.")  # short prompt: the local model only reads ~77 tokens
 
 app = FastAPI(title="Comic Forge")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
