@@ -1,5 +1,5 @@
 """Comic Forge API: story -> LLM storyboard plan -> consistent panel images -> PDF."""
-import io, json, os, re, textwrap, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, io, json, os, re, textwrap, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -10,7 +10,7 @@ from huggingface_hub import InferenceClient
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-# Load HF_TOKEN from backend/.env so no terminal commands are needed
+# Load tokens from backend/.env so no terminal commands are needed (on Render, use the Environment tab)
 _env = Path(__file__).parent / ".env"
 if _env.exists():
     for _line in _env.read_text().splitlines():
@@ -24,10 +24,15 @@ _tok = os.getenv("HF_TOKEN", "")
 if not _tok.startswith("hf_"):
     print("\n*** HF_TOKEN missing or invalid. Open backend/token.txt and paste your token ***\n")
 else:
-    print("HF_TOKEN loaded OK")
+    print("HF_TOKEN loaded OK", flush=True)
+if os.getenv("CF_ACCOUNT_ID", "").strip() and os.getenv("CF_API_TOKEN", "").strip():
+    print("Cloudflare AI ready", flush=True)
+else:
+    print("Cloudflare keys not set", flush=True)
 
 IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 STORAGE = Path(__file__).resolve().parent / "storage"
 STORAGE.mkdir(parents=True, exist_ok=True)
 STYLES = {
@@ -39,7 +44,58 @@ STYLES = {
     "Retro Sci-Fi": "1960s retro sci-fi pulp cover art, painted, bold colors",
 }
 JOBS: dict[str, dict] = {}
-STATE = {"hf": True, "poll": True}  # turns False when Hugging Face has no credits -> use free Pollinations instead
+
+# A provider is only PAUSED for a while after an error, never switched off forever.
+_OFF = {"cf": 0.0, "hf": 0.0, "poll": 0.0}
+
+
+def _is_on(name: str) -> bool:
+    return time.time() >= _OFF[name]
+
+
+def _pause(name: str, err) -> None:
+    s = str(err)
+    if any(c in s for c in ("401", "403")):
+        secs = 3600      # wrong key: pause for an hour
+    elif "402" in s:
+        secs = 1800      # credits used up: pause 30 minutes
+    elif "429" in s:
+        secs = 90        # rate limited: pause 90 seconds
+    else:
+        secs = 0         # timeout or temporary error: try again next time
+    if secs:
+        _OFF[name] = time.time() + secs
+
+
+def cf_ready() -> bool:
+    return bool(os.getenv("CF_ACCOUNT_ID", "").strip() and os.getenv("CF_API_TOKEN", "").strip())
+
+
+def cloudflare_image(prompt: str, seed: int) -> Image.Image:
+    """Cloudflare Workers AI (FLUX.1 schnell), free daily quota."""
+    acct = os.getenv("CF_ACCOUNT_ID", "").strip()
+    token = os.getenv("CF_API_TOKEN", "").strip()
+    url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{CF_IMAGE_MODEL}"
+    body = json.dumps({"prompt": prompt[:2000], "steps": 6, "seed": seed % (2 ** 31)}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "comic-forge",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "ignore")[:200]
+        raise RuntimeError(f"HTTP {e.code}: {detail}")
+    try:  # FLUX returns JSON with a base64 image
+        data = json.loads(raw)
+        if not data.get("success", True):
+            raise RuntimeError(f"Cloudflare error: {str(data.get('errors'))[:200]}")
+        raw = base64.b64decode(data["result"]["image"])
+    except (ValueError, KeyError, TypeError):
+        pass  # some models return the image bytes directly
+    return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
 def pollinations_image(prompt: str, seed: int) -> Image.Image:
@@ -68,7 +124,7 @@ _LOCK = threading.Lock()
 
 
 def local_image(prompt: str, seed: int) -> Image.Image:
-    """Last resort: SD-Turbo running on your own PC (CPU or GPU). Free, needs no account."""
+    """Last resort: SD-Turbo running on your own PC (CPU or GPU). Not available on Render (no torch)."""
     import torch
     from diffusers import AutoPipelineForText2Image
     with _LOCK:
@@ -84,20 +140,34 @@ def local_image(prompt: str, seed: int) -> Image.Image:
 
 
 def make_image(client, prompt: str, seed: int, short: str) -> Image.Image:
-    if STATE["hf"]:
+    errors = []
+
+    # (name, function) in order of preference
+    providers = []
+    if cf_ready():
+        providers.append(("cf", lambda: cloudflare_image(prompt, seed)))
+    if os.getenv("HF_TOKEN", "").startswith("hf_"):
+        providers.append(("hf", lambda: client.text_to_image(prompt, width=768, height=768, seed=seed)))
+    providers.append(("poll", lambda: pollinations_image(prompt, seed)))
+
+    # Use providers that are not paused; if all are paused, try them all anyway
+    active = [p for p in providers if _is_on(p[0])] or providers
+
+    for name, fn in active:
         try:
-            return client.text_to_image(prompt, width=768, height=768, seed=seed)
+            return fn()
         except Exception as e:
-            if any(c in str(e) for c in ("401", "402", "403", "429")):
-                STATE["hf"] = False
-            else:
-                raise
-    if STATE["poll"]:
-        try:
-            return pollinations_image(prompt, seed)
-        except Exception:
-            STATE["poll"] = False
-    raise RuntimeError("Image generation services are temporarily unavailable.")  # short prompt: the local model only reads ~77 tokens
+            errors.append(f"{name}: {str(e)[:150]}")
+            print(f"{name} image failed:", e, flush=True)
+            _pause(name, e)
+
+    try:
+        return local_image(short, seed)
+    except Exception as e:  # ImportError on Render (no torch)
+        if not isinstance(e, ImportError):
+            errors.append(f"local: {str(e)[:100]}")
+    raise RuntimeError("Image services unavailable: " + " | ".join(errors)[:500])
+
 
 app = FastAPI(title="Comic Forge")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -148,8 +218,8 @@ def run_job(job_id: str, body: StoryIn):
         try:
             plan = plan_story(body.story, body.panels)
         except Exception as e:
-            if "402" in str(e):
-                STATE["hf"] = False
+            print("Story planning failed:", e, flush=True)
+            _pause("hf", e)
             plan = fallback_plan(body.story, body.panels)
         cast = {c["name"].lower(): c["description"] for c in plan.get("characters", [])}
         job["characters"] = plan.get("characters", [])
@@ -167,6 +237,7 @@ def run_job(job_id: str, body: StoryIn):
             job["panels"][i]["image"] = f"/files/{job_id}/panel_{i}.png"
         job["status"] = "done"
     except Exception as e:
+        print("Job failed:", e, flush=True)
         job.update(status="error", error=str(e))
 
 
