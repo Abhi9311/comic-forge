@@ -1,0 +1,10 @@
+token.txt
+.env
+venv/
+node_modules/
+frontend/dist/
+backend/storage/
+__pycache__/
+*.pyc
+test.png
+.venv/
