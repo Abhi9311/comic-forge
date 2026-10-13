@@ -26,6 +26,7 @@ if not _tok.startswith("hf_"):
 else:
     print("HF_TOKEN loaded OK", flush=True)
 os.environ["CF_ACCOUNT_ID"] = "28866cfeed887f180dfa6575b1b50f68"
+_cid = os.getenv("CF_ACCOUNT_ID", "").strip()
 print(f"Cloudflare account id length={len(_cid)} ends={_cid[-4:]} token_set={bool(os.getenv('CF_API_TOKEN', '').strip())}", flush=True)
 
 IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
