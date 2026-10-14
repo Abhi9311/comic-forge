@@ -8,3 +8,4 @@ backend/storage/
 __pycache__/
 *.pyc
 test.png
+*.bak*

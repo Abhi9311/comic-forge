@@ -1,55 +1,85 @@
-import py_compile, shutil
+"""Usage (inside the backend folder):  python apply_patch2.py
+Shorter provider pauses, clearer errors, and a /api/health page."""
+import py_compile, shutil, sys
 from pathlib import Path
 
-NEW = '''def plan_story(story: str, n: int) -> dict:
-    """LLM turns a story into a character sheet + panel list (strict JSON). Uses free Cloudflare AI first."""
-    system = (
-        "You are a comic storyboard artist. Reply with ONLY JSON: "
-        '{"characters":[{"name":str,"description":str}],'
-        '"panels":[{"caption":str,"scene":str,"characters":[str]}]}. '
-        f"Exactly {n} panels. Each character description is a FIXED visual description "
-        "(age, hair, clothes, colours) under 25 words. scene = purely visual, what the camera sees. "
-        "caption = max 14 words. Use character names exactly as in the character list."
-    )
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": story}]
-    text = None
-    if cf_ready():
-        try:
-            acct = os.getenv("CF_ACCOUNT_ID", "").strip()
-            req = urllib.request.Request(
-                f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions",
-                data=json.dumps({"model": "@cf/meta/llama-3.1-8b-instruct", "messages": messages,
-                                 "max_tokens": 3000, "temperature": 0.6}).encode(),
-                method="POST",
-                headers={"Authorization": f"Bearer {os.getenv('CF_API_TOKEN', '').strip()}",
-                         "Content-Type": "application/json", "User-Agent": "comic-forge"})
-            with urllib.request.urlopen(req, timeout=120) as r:
-                text = json.loads(r.read())["choices"][0]["message"]["content"]
-        except Exception as e:
-            print("Cloudflare planning failed:", e, flush=True)
-    if text is None:
-        if not (os.getenv("HF_TOKEN", "").startswith("hf_") and _is_on("hf")):
-            raise RuntimeError("no story planner available")
-        client = InferenceClient(token=os.getenv("HF_TOKEN"))
-        text = client.chat_completion(model=LLM_MODEL, max_tokens=4000, temperature=0.6,
-                                      messages=messages).choices[0].message.content
-    data = json.loads(re.search(r"\\{.*\\}", text, re.S).group(0))
-    assert data["panels"], "empty plan"
-    return data
+PAUSE = '''_LAST = {}  # last error per provider (shown in errors and on /api/health)
+
+
+def _pause(name: str, err) -> None:
+    s = str(err)
+    _LAST[name] = s[:200]
+    if any(c in s for c in ("401", "403")):
+        secs = 300       # key problem: pause 5 minutes
+    elif "402" in s:
+        secs = 600       # credits used up: pause 10 minutes
+    elif "429" in s:
+        secs = 20 if name == "cf" else 90
+    else:
+        secs = 0         # timeout or temporary error: try again next time
+    if secs:
+        _OFF[name] = time.time() + secs
+
+
 '''
 
-p = Path("main.py")
+MAKE = '''def make_image(client, prompt: str, seed: int, short: str) -> Image.Image:
+    errors = []
+    providers = []
+    if cf_ready():
+        providers.append(("cf", lambda: cloudflare_image(prompt, seed)))
+    else:
+        errors.append("cf: CF_ACCOUNT_ID or CF_API_TOKEN is not set on this server")
+    if os.getenv("HF_TOKEN", "").startswith("hf_"):
+        providers.append(("hf", lambda: client.text_to_image(prompt, width=768, height=768, seed=seed)))
+    providers.append(("poll", lambda: pollinations_image(prompt, seed)))
+
+    paused = [n for n, _ in providers if not _is_on(n)]
+    active = [p for p in providers if p[0] not in paused] or providers
+    if active is not providers:
+        for n in paused:
+            errors.append(f"{n}: paused {int(_OFF[n] - time.time())}s after {_LAST.get(n, 'an error')[:90]}")
+
+    for name, fn in active:
+        try:
+            return fn()
+        except Exception as e:
+            errors.append(f"{name}: {str(e)[:150]}")
+            print(f"{name} image failed:", e, flush=True)
+            _pause(name, e)
+
+    try:
+        return local_image(short, seed)
+    except Exception as e:  # ImportError on Render (no torch)
+        if not isinstance(e, ImportError):
+            errors.append(f"local: {str(e)[:100]}")
+    raise RuntimeError("Image services unavailable: " + " | ".join(errors)[:700])
+
+
+'''
+
+HEALTH = '''@app.get("/api/health")
+def health():
+    now = time.time()
+    return {"cloudflare_configured": cf_ready(),
+            "hf_token_set": os.getenv("HF_TOKEN", "").startswith("hf_"),
+            "paused_seconds_left": {k: max(0, int(v - now)) for k, v in _OFF.items()},
+            "last_errors": _LAST}
+
+
+'''
+
+p = Path(sys.argv[1] if len(sys.argv) > 1 else "main.py")
 s = p.read_text(encoding="utf-8")
-if not Path("main.py.bak").exists():
-    shutil.copy(p, "main.py.bak")
-done = []
-if "Cloudflare planning failed" not in s:
-    a, b = s.index("def plan_story("), s.index("def fallback_plan(")
-    s = s[:a] + NEW + "\n\n" + s[b:]
-    done.append("planner")
-if '"steps": 6' in s:
-    s = s.replace('"steps": 6', '"steps": 4')
-    done.append("steps")
+if "_LAST = {}" in s:
+    raise SystemExit("Already patched. Nothing to do.")
+if not Path(str(p) + ".bak2").exists():
+    shutil.copy(p, str(p) + ".bak2")
+a, b = s.index("def _pause("), s.index("def cf_ready(")
+s = s[:a] + PAUSE + s[b:]
+a, b = s.index("def make_image("), s.index("app = FastAPI(")
+s = s[:a] + MAKE + s[b:]
+s = s.replace("class StoryIn(BaseModel):", HEALTH + "class StoryIn(BaseModel):", 1)
 p.write_text(s, encoding="utf-8")
-py_compile.compile("main.py", doraise=True)
-print("PATCHED OK:", done or "nothing to change (already done)")
+py_compile.compile(str(p), doraise=True)
+print("PATCHED OK. Backup saved as main.py.bak2")
