@@ -26,9 +26,9 @@ if not _tok.startswith("hf_"):
 else:
     print("HF_TOKEN loaded OK", flush=True)
 
-# Default Cloudflare account ID. If CF_ACCOUNT_ID is set in Render > Environment (or .env),
-# that value wins; otherwise this one is used. CF_API_TOKEN must still be set in Render.
-os.environ.setdefault("CF_ACCOUNT_ID", "28866cfeed887f180dfa6575b1b50f68")
+# Forced Cloudflare account ID (overrides any CF_ACCOUNT_ID set in Render or .env).
+# CF_API_TOKEN must still be set in Render > Environment.
+os.environ["CF_ACCOUNT_ID"] = "28866cfeed887f180dfa6575b1b50f68"
 _cid = os.getenv("CF_ACCOUNT_ID", "").strip()
 print(f"Cloudflare account id length={len(_cid)} ends={_cid[-4:]} token_set={bool(os.getenv('CF_API_TOKEN', '').strip())}", flush=True)
 
