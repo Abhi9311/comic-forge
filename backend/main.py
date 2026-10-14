@@ -1,5 +1,5 @@
 """Comic Forge API: story -> LLM storyboard plan -> consistent panel images -> PDF."""
-import base64, io, json, os, re, textwrap, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, datetime, io, json, os, re, textwrap, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -10,22 +10,25 @@ from huggingface_hub import InferenceClient
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-# Load tokens from backend/.env so no terminal commands are needed (on Render, use the Environment tab)
+# Load tokens from backend/.env (locally). On Render, use the Environment tab.
 _env = Path(__file__).parent / ".env"
 if _env.exists():
     for _line in _env.read_text().splitlines():
         if "=" in _line and not _line.strip().startswith("#"):
             _k, _v = _line.split("=", 1)
             os.environ[_k.strip()] = _v.strip().strip('"').strip("'")
-_txt = Path(__file__).parent / "token.txt"  # visible alternative: just paste the token inside
+_txt = Path(__file__).parent / "token.txt"
 if _txt.exists() and _txt.read_text().strip().startswith("hf_"):
     os.environ["HF_TOKEN"] = _txt.read_text().strip()
 _tok = os.getenv("HF_TOKEN", "")
 if not _tok.startswith("hf_"):
-    print("\n*** HF_TOKEN missing or invalid. Open backend/token.txt and paste your token ***\n")
+    print("\n*** HF_TOKEN missing or invalid. Set it in .env / token.txt / Render Environment ***\n")
 else:
     print("HF_TOKEN loaded OK", flush=True)
-os.environ["CF_ACCOUNT_ID"] = "28866cfeed887f180dfa6575b1b50f68"
+
+# Default Cloudflare account ID. If CF_ACCOUNT_ID is set in Render > Environment (or .env),
+# that value wins; otherwise this one is used. CF_API_TOKEN must still be set in Render.
+os.environ.setdefault("CF_ACCOUNT_ID", "28866cfeed887f180dfa6575b1b50f68")
 _cid = os.getenv("CF_ACCOUNT_ID", "").strip()
 print(f"Cloudflare account id length={len(_cid)} ends={_cid[-4:]} token_set={bool(os.getenv('CF_API_TOKEN', '').strip())}", flush=True)
 
@@ -43,25 +46,45 @@ STYLES = {
     "Retro Sci-Fi": "1960s retro sci-fi pulp cover art, painted, bold colors",
 }
 JOBS: dict[str, dict] = {}
+BODIES: dict[str, "StoryIn"] = {}   # original request per job (for retry)
+PLANS: dict[str, dict] = {}         # storyboard per job (so retry doesn't re-plan)
 
-# A provider is only PAUSED for a while after an error, never switched off forever.
+# A provider is PAUSED for a while after an error, never switched off forever.
 _OFF = {"cf": 0.0, "hf": 0.0, "poll": 0.0}
+_LAST = {}  # last error per provider (shown on /api/health)
+
+QUOTA_MSG = "Daily free image quota reached. Please try again after 5:30 AM IST."
+BUSY_MSG = "Image services are temporarily unavailable. Please try again in a few minutes."
 
 
 def _is_on(name: str) -> bool:
     return time.time() >= _OFF[name]
 
 
+def _next_utc_midnight() -> float:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    nxt = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return nxt.timestamp()
+
+
 def _pause(name: str, err) -> None:
+    # FIX 2: smarter pauses. Daily quota -> until reset. Pollinations 402 -> 1 hour.
     s = str(err)
+    _LAST[name] = s[:200]
+    if name == "cf" and ("daily free allocation" in s or "neurons" in s):
+        _OFF[name] = _next_utc_midnight()
+        return
+    if name == "poll" and "402" in s:
+        _OFF[name] = time.time() + 3600
+        return
     if any(c in s for c in ("401", "403")):
-        secs = 3600      # wrong key: pause for an hour
+        secs = 300
     elif "402" in s:
-        secs = 1800      # credits used up: pause 30 minutes
+        secs = 600
     elif "429" in s:
-        secs = 90        # rate limited: pause 90 seconds
+        secs = 20 if name == "cf" else 90
     else:
-        secs = 0         # timeout or temporary error: try again next time
+        secs = 0
     if secs:
         _OFF[name] = time.time() + secs
 
@@ -98,7 +121,7 @@ def cloudflare_image(prompt: str, seed: int) -> Image.Image:
 
 
 def pollinations_image(prompt: str, seed: int) -> Image.Image:
-    """Free fallback image generator (anonymous tier: about 1 image per 15 seconds)."""
+    """Free fallback (anonymous tier, may now require payment/key)."""
     url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:900])
            + f"?width=768&height=768&seed={seed}&model=flux&nologo=true")
     last = None
@@ -109,9 +132,9 @@ def pollinations_image(prompt: str, seed: int) -> Image.Image:
                 return Image.open(io.BytesIO(r.read())).convert("RGB")
         except urllib.error.HTTPError as e:
             last = e
-            if e.code != 429:
+            if e.code != 429:   # 402 etc: don't waste time retrying
                 break
-            time.sleep(16)  # rate limited: wait and retry
+            time.sleep(16)
         except Exception as e:
             last = e
             time.sleep(5)
@@ -123,7 +146,7 @@ _LOCK = threading.Lock()
 
 
 def local_image(prompt: str, seed: int) -> Image.Image:
-    """Last resort: SD-Turbo running on your own PC (CPU or GPU). Not available on Render (no torch)."""
+    """Last resort: SD-Turbo on your own PC. Not available on Render (no torch)."""
     import torch
     from diffusers import AutoPipelineForText2Image
     with _LOCK:
@@ -140,17 +163,22 @@ def local_image(prompt: str, seed: int) -> Image.Image:
 
 def make_image(client, prompt: str, seed: int, short: str) -> Image.Image:
     errors = []
-
-    # (name, function) in order of preference
     providers = []
     if cf_ready():
         providers.append(("cf", lambda: cloudflare_image(prompt, seed)))
+    else:
+        errors.append("cf: CF_ACCOUNT_ID or CF_API_TOKEN is not set on this server")
     if os.getenv("HF_TOKEN", "").startswith("hf_"):
         providers.append(("hf", lambda: client.text_to_image(prompt, width=768, height=768, seed=seed)))
     providers.append(("poll", lambda: pollinations_image(prompt, seed)))
 
-    # Use providers that are not paused; if all are paused, try them all anyway
-    active = [p for p in providers if _is_on(p[0])] or providers
+    paused = [n for n, _ in providers if not _is_on(n)]
+    active = [p for p in providers if p[0] not in paused]
+    if not active:                      # everything paused: try all anyway
+        active = providers
+    else:
+        for n in paused:
+            errors.append(f"{n}: paused {int(_OFF[n] - time.time())}s after {_LAST.get(n, 'an error')[:90]}")
 
     for name, fn in active:
         try:
@@ -165,12 +193,28 @@ def make_image(client, prompt: str, seed: int, short: str) -> Image.Image:
     except Exception as e:  # ImportError on Render (no torch)
         if not isinstance(e, ImportError):
             errors.append(f"local: {str(e)[:100]}")
-    raise RuntimeError("Image services unavailable: " + " | ".join(errors)[:500])
+
+    # FIX 3: friendly message for users, full detail only in the server logs
+    detail = " | ".join(errors) + " | " + " | ".join(_LAST.values())
+    print("All image providers failed:", detail[:1500], flush=True)
+    if "daily free allocation" in detail or "neurons" in detail:
+        raise RuntimeError(QUOTA_MSG)
+    raise RuntimeError(BUSY_MSG)
 
 
 app = FastAPI(title="Comic Forge")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/files", StaticFiles(directory=STORAGE), name="files")
+
+
+@app.get("/api/health")
+def health():
+    now = time.time()
+    return {"cloudflare_configured": cf_ready(),
+            "cloudflare_account_ends": os.getenv("CF_ACCOUNT_ID", "").strip()[-4:],
+            "hf_token_set": os.getenv("HF_TOKEN", "").startswith("hf_"),
+            "paused_seconds_left": {k: max(0, int(v - now)) for k, v in _OFF.items()},
+            "last_errors": _LAST}
 
 
 class StoryIn(BaseModel):
@@ -180,7 +224,7 @@ class StoryIn(BaseModel):
 
 
 def plan_story(story: str, n: int) -> dict:
-    """LLM turns a story into a character sheet + panel list (strict JSON). Uses free Cloudflare AI first."""
+    """LLM turns a story into a character sheet + panel list (strict JSON)."""
     system = (
         "You are a comic storyboard artist. Reply with ONLY JSON: "
         '{"characters":[{"name":str,"description":str}],'
@@ -191,7 +235,7 @@ def plan_story(story: str, n: int) -> dict:
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": story}]
     text = None
-    if cf_ready():
+    if cf_ready() and _is_on("cf"):     # skip Cloudflare while its quota is exhausted
         try:
             acct = os.getenv("CF_ACCOUNT_ID", "").strip()
             req = urllib.request.Request(
@@ -203,14 +247,23 @@ def plan_story(story: str, n: int) -> dict:
                          "Content-Type": "application/json", "User-Agent": "comic-forge"})
             with urllib.request.urlopen(req, timeout=120) as r:
                 text = json.loads(r.read())["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "ignore")[:200]
+            print("Cloudflare planning failed:", e.code, detail, flush=True)
+            _pause("cf", f"HTTP {e.code}: {detail}")
         except Exception as e:
             print("Cloudflare planning failed:", e, flush=True)
+            _pause("cf", e)
     if text is None:
         if not (os.getenv("HF_TOKEN", "").startswith("hf_") and _is_on("hf")):
             raise RuntimeError("no story planner available")
-        client = InferenceClient(token=os.getenv("HF_TOKEN"))
-        text = client.chat_completion(model=LLM_MODEL, max_tokens=4000, temperature=0.6,
-                                      messages=messages).choices[0].message.content
+        try:
+            client = InferenceClient(token=os.getenv("HF_TOKEN"))
+            text = client.chat_completion(model=LLM_MODEL, max_tokens=4000, temperature=0.6,
+                                          messages=messages).choices[0].message.content
+        except Exception as e:
+            _pause("hf", e)
+            raise
     data = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
     assert data["panels"], "empty plan"
     return data
@@ -221,7 +274,6 @@ def fallback_plan(story: str, n: int) -> dict:
     sents = re.split(r"(?<=[.!?])\s+", story.strip())
     size = max(1, -(-len(sents) // n))
     chunks = [" ".join(sents[i:i + size]) for i in range(0, len(sents), size)][:n]
-    # first sentence usually introduces the hero, so reuse it as the fixed character description
     hero = {"name": "Hero", "description": (sents[0] if sents else story)[:200]}
     return {"characters": [hero], "panels": [
         {"caption": " ".join(c.split()[:14]), "scene": c[:260], "characters": ["Hero"]} for c in chunks]}
@@ -229,14 +281,17 @@ def fallback_plan(story: str, n: int) -> dict:
 
 def run_job(job_id: str, body: StoryIn):
     job = JOBS[job_id]
-    out_dir = STORAGE / job_id; out_dir.mkdir(exist_ok=True)
+    out_dir = STORAGE / job_id
+    out_dir.mkdir(exist_ok=True)
     try:
-        try:
-            plan = plan_story(body.story, body.panels)
-        except Exception as e:
-            print("Story planning failed:", e, flush=True)
-            _pause("hf", e)
-            plan = fallback_plan(body.story, body.panels)
+        plan = PLANS.get(job_id)        # reuse the plan on retry
+        if plan is None:
+            try:
+                plan = plan_story(body.story, body.panels)
+            except Exception as e:
+                print("Story planning failed:", e, flush=True)
+                plan = fallback_plan(body.story, body.panels)
+            PLANS[job_id] = plan
         cast = {c["name"].lower(): c["description"] for c in plan.get("characters", [])}
         job["characters"] = plan.get("characters", [])
         job["panels"] = [{"caption": p["caption"], "scene": p["scene"], "image": None} for p in plan["panels"]]
@@ -245,13 +300,17 @@ def run_job(job_id: str, body: StoryIn):
         client = InferenceClient(model=IMAGE_MODEL, token=os.getenv("HF_TOKEN"))
         style = STYLES.get(body.style, STYLES["Comic Book"])
         for i, p in enumerate(plan["panels"]):
-            # Consistency: same seed + the SAME character description injected into every panel
+            path = out_dir / f"panel_{i}.png"
+            if path.exists():           # FIX 4: don't re-spend quota on finished panels
+                job["panels"][i]["image"] = f"/files/{job_id}/panel_{i}.png"
+                continue
             who = " ".join(f"{n}: {cast[n.lower()]}." for n in p.get("characters", []) if n.lower() in cast)
             prompt = f"{style}. {p['scene']}. {who}"
             short = f"{', '.join(style.split(',')[:2])}. {who[:150]} {p['scene'][:100]}"
-            make_image(client, prompt, job["seed"], short).save(out_dir / f"panel_{i}.png")
+            make_image(client, prompt, job["seed"], short).save(path)
             job["panels"][i]["image"] = f"/files/{job_id}/panel_{i}.png"
         job["status"] = "done"
+        job.pop("error", None)
     except Exception as e:
         print("Job failed:", e, flush=True)
         job.update(status="error", error=str(e))
@@ -283,8 +342,22 @@ def create_story(body: StoryIn):
     job_id = uuid.uuid4().hex[:10]
     JOBS[job_id] = {"id": job_id, "status": "planning", "characters": [], "panels": [],
                     "style": body.style, "seed": int.from_bytes(os.urandom(3), "big")}
+    BODIES[job_id] = body
     threading.Thread(target=run_job, args=(job_id, body), daemon=True).start()
     return {"id": job_id}
+
+
+@app.post("/api/stories/{job_id}/retry")
+def retry_story(job_id: str):
+    """Resume a failed job: finished panels are kept, only missing ones are drawn."""
+    if job_id not in JOBS or job_id not in BODIES:
+        raise HTTPException(404, "Story not found")
+    if JOBS[job_id]["status"] != "error":
+        raise HTTPException(400, "Only failed stories can be retried")
+    JOBS[job_id].update(status="drawing" if job_id in PLANS else "planning")
+    JOBS[job_id].pop("error", None)
+    threading.Thread(target=run_job, args=(job_id, BODIES[job_id]), daemon=True).start()
+    return {"id": job_id, "status": JOBS[job_id]["status"]}
 
 
 @app.get("/api/stories/{job_id}")
