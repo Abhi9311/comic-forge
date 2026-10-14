@@ -26,15 +26,17 @@ if not _tok.startswith("hf_"):
 else:
     print("HF_TOKEN loaded OK", flush=True)
 
-# Forced Cloudflare account ID (overrides any CF_ACCOUNT_ID set in Render or .env).
-# CF_API_TOKEN must still be set in Render > Environment.
-os.environ["CF_ACCOUNT_ID"] = "28866cfeed887f180dfa6575b1b50f68"
+# CF_ACCOUNT_ID from Render > Environment (or .env) wins. The built-in ID is only a
+# fallback when nothing is set. CF_API_TOKEN must belong to the same Cloudflare account.
+os.environ.setdefault("CF_ACCOUNT_ID", "28866cfeed887f180dfa6575b1b50f68")
 _cid = os.getenv("CF_ACCOUNT_ID", "").strip()
 print(f"Cloudflare account id length={len(_cid)} ends={_cid[-4:]} token_set={bool(os.getenv('CF_API_TOKEN', '').strip())}", flush=True)
 
 IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 CF_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+# Story-planning models, tried in order (older Llama 3.x models were deprecated on 2026-05-30)
+CF_CHAT_MODELS = ["@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
 STORAGE = Path(__file__).resolve().parent / "storage"
 STORAGE.mkdir(parents=True, exist_ok=True)
 STYLES = {
@@ -236,24 +238,30 @@ def plan_story(story: str, n: int) -> dict:
     messages = [{"role": "system", "content": system}, {"role": "user", "content": story}]
     text = None
     if cf_ready() and _is_on("cf"):     # skip Cloudflare while its quota is exhausted
-        try:
-            acct = os.getenv("CF_ACCOUNT_ID", "").strip()
-            req = urllib.request.Request(
-                f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions",
-                data=json.dumps({"model": "@cf/meta/llama-3.1-8b-instruct", "messages": messages,
-                                 "max_tokens": 3000, "temperature": 0.6}).encode(),
-                method="POST",
-                headers={"Authorization": f"Bearer {os.getenv('CF_API_TOKEN', '').strip()}",
-                         "Content-Type": "application/json", "User-Agent": "comic-forge"})
-            with urllib.request.urlopen(req, timeout=120) as r:
-                text = json.loads(r.read())["choices"][0]["message"]["content"]
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "ignore")[:200]
-            print("Cloudflare planning failed:", e.code, detail, flush=True)
-            _pause("cf", f"HTTP {e.code}: {detail}")
-        except Exception as e:
-            print("Cloudflare planning failed:", e, flush=True)
-            _pause("cf", e)
+        acct = os.getenv("CF_ACCOUNT_ID", "").strip()
+        for model in CF_CHAT_MODELS:    # try newer models if one is deprecated (404/410)
+            try:
+                req = urllib.request.Request(
+                    f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions",
+                    data=json.dumps({"model": model, "messages": messages,
+                                     "max_tokens": 3000, "temperature": 0.6}).encode(),
+                    method="POST",
+                    headers={"Authorization": f"Bearer {os.getenv('CF_API_TOKEN', '').strip()}",
+                             "Content-Type": "application/json", "User-Agent": "comic-forge"})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    text = json.loads(r.read())["choices"][0]["message"]["content"]
+                break
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "ignore")[:200]
+                print(f"Cloudflare planning failed ({model}):", e.code, detail, flush=True)
+                if e.code in (404, 410):
+                    continue            # model gone: try the next one
+                _pause("cf", f"HTTP {e.code}: {detail}")
+                break
+            except Exception as e:
+                print(f"Cloudflare planning failed ({model}):", e, flush=True)
+                _pause("cf", e)
+                break
     if text is None:
         if not (os.getenv("HF_TOKEN", "").startswith("hf_") and _is_on("hf")):
             raise RuntimeError("no story planner available")
