@@ -75,7 +75,7 @@ def cloudflare_image(prompt: str, seed: int) -> Image.Image:
     acct = os.getenv("CF_ACCOUNT_ID", "").strip()
     token = os.getenv("CF_API_TOKEN", "").strip()
     url = f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{CF_IMAGE_MODEL}"
-    body = json.dumps({"prompt": prompt[:2000], "steps": 6}).encode()
+    body = json.dumps({"prompt": prompt[:2000], "steps": 4}).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -180,7 +180,7 @@ class StoryIn(BaseModel):
 
 
 def plan_story(story: str, n: int) -> dict:
-    """LLM turns a story into a character sheet + panel list (strict JSON)."""
+    """LLM turns a story into a character sheet + panel list (strict JSON). Uses free Cloudflare AI first."""
     system = (
         "You are a comic storyboard artist. Reply with ONLY JSON: "
         '{"characters":[{"name":str,"description":str}],'
@@ -189,12 +189,29 @@ def plan_story(story: str, n: int) -> dict:
         "(age, hair, clothes, colours) under 25 words. scene = purely visual, what the camera sees. "
         "caption = max 14 words. Use character names exactly as in the character list."
     )
-    client = InferenceClient(token=os.getenv("HF_TOKEN"))
-    out = client.chat_completion(
-        model=LLM_MODEL, max_tokens=4000, temperature=0.6,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": story}],
-    )
-    data = json.loads(re.search(r"\{.*\}", out.choices[0].message.content, re.S).group(0))
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": story}]
+    text = None
+    if cf_ready():
+        try:
+            acct = os.getenv("CF_ACCOUNT_ID", "").strip()
+            req = urllib.request.Request(
+                f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions",
+                data=json.dumps({"model": "@cf/meta/llama-3.1-8b-instruct", "messages": messages,
+                                 "max_tokens": 3000, "temperature": 0.6}).encode(),
+                method="POST",
+                headers={"Authorization": f"Bearer {os.getenv('CF_API_TOKEN', '').strip()}",
+                         "Content-Type": "application/json", "User-Agent": "comic-forge"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                text = json.loads(r.read())["choices"][0]["message"]["content"]
+        except Exception as e:
+            print("Cloudflare planning failed:", e, flush=True)
+    if text is None:
+        if not (os.getenv("HF_TOKEN", "").startswith("hf_") and _is_on("hf")):
+            raise RuntimeError("no story planner available")
+        client = InferenceClient(token=os.getenv("HF_TOKEN"))
+        text = client.chat_completion(model=LLM_MODEL, max_tokens=4000, temperature=0.6,
+                                      messages=messages).choices[0].message.content
+    data = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
     assert data["panels"], "empty plan"
     return data
 

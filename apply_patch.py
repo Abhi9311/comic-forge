@@ -1,5 +1,3 @@
-"""Run inside the backend folder:  python apply_patch.py
-Makes the story planner use free Cloudflare AI (falls back to Hugging Face)."""
 import py_compile, shutil
 from pathlib import Path
 
@@ -42,10 +40,16 @@ NEW = '''def plan_story(story: str, n: int) -> dict:
 
 p = Path("main.py")
 s = p.read_text(encoding="utf-8")
-if "Cloudflare planning failed" in s:
-    raise SystemExit("Already patched. Nothing to do.")
-a, b = s.index("def plan_story("), s.index("def fallback_plan(")
-shutil.copy(p, "main.py.bak")
-p.write_text(s[:a] + NEW + "\n\n" + s[b:], encoding="utf-8")
+if not Path("main.py.bak").exists():
+    shutil.copy(p, "main.py.bak")
+done = []
+if "Cloudflare planning failed" not in s:
+    a, b = s.index("def plan_story("), s.index("def fallback_plan(")
+    s = s[:a] + NEW + "\n\n" + s[b:]
+    done.append("planner")
+if '"steps": 6' in s:
+    s = s.replace('"steps": 6', '"steps": 4')
+    done.append("steps")
+p.write_text(s, encoding="utf-8")
 py_compile.compile("main.py", doraise=True)
-print("PATCHED OK. Backup saved as main.py.bak")
+print("PATCHED OK:", done or "nothing to change (already done)")
